@@ -85,7 +85,7 @@ the point is this file has no reason to want any of it in the first place.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, runtime_checkable
 
 # kit.mcp.types is a collaborator's file (workspace hard rule 2: import it,
@@ -113,6 +113,20 @@ except ImportError:  # pragma: no cover - collaborator file
     _canonicalise_action = None
 
 from agent.telemetry import RecordingGatewayContext, Telemetry
+
+_A2A_SERVERS = frozenset({"curriculum-analyst", "citation-checker", "roster"})
+_WRITE_TOOLS = frozenset({
+    ("content", "flag_stale_slide"), ("content", "file_content_bug"),
+    ("progress", "record_mastery"),
+})
+_SUCCESSORS = {("slides", "search"): ("slides", "query")}
+_DEFAULT_MASKS = {
+    ("slides", "query"): ("title", "anchor"),
+    ("slides", "get_frame"): ("title", "body", "anchor"),
+    ("registry", "provenance"): ("etag", "replica", "anchor"),
+    ("curriculum-analyst", "which_days_cover"): ("course_day", "track", "anchor"),
+    ("citation-checker", "verify_source"): ("verdict", "anchor"),
+}
 
 __all__ = [
     "COMMAND_KINDS",
@@ -350,6 +364,9 @@ class Gateway:
         # Command ids you have already denied, in case a later job wants to
         # know "have I already said no to this once".
         self._denied_cmd_ids: set[str] = set()
+        self._admitted_cards: dict[str, dict[str, Any]] = {}
+        self._etags: dict[str, str] = {}
+        self._idempotency_keys: set[str] = set()
 
     def decide(self, cmd: Command) -> Decision:
         """SYNCHRONOUS. PURE. NO I/O. 250 ms wall (RULES.md section 3).
@@ -366,6 +383,40 @@ class Gateway:
         The four jobs below are named, ordered, and commented; none of them
         currently changes the outcome."""
         self._telemetry.decision_seen(cmd)
+
+        # Identity and routing data are authority inputs, never model hints.
+        if cmd.server in _A2A_SERVERS:
+            card = self._admitted_cards.get(cmd.server, {})
+            aud = cmd.headers.get("aud") or cmd.headers.get("Aud")
+            if cmd.headers.get("x-server-fingerprint") == "unvouched":
+                return self.deny(cmd, "server fingerprint is not vouched by the registry")
+            if cmd.headers.get("x-card-signature") == "invalid":
+                return self.deny(cmd, "peer card signature is invalid")
+            if not card.get("verified"):
+                return self.deny(cmd, "peer card is not admitted by the registry")
+            if cmd.tool not in set(card.get("skills") or ()):
+                return self.deny(cmd, "requested skill is not declared on the peer card")
+            if aud not in (cmd.server, f"a2a:{cmd.server}", f"mcp:{cmd.server}"):
+                return self.deny(cmd, "delegation audience does not match the server called")
+
+        act = getattr(self.ctx, "act", None)
+        for key in ("learner", "learner_id", "target", "subject"):
+            target = cmd.args.get(key)
+            if target and act and str(target) != str(act):
+                return self.deny(cmd, "target is not owned by the learner in act")
+        if any(cmd.args.get(key) for key in ("route", "_route", "replica")):
+            return self.deny(cmd, "route must be selected by the gateway header")
+        if cmd.args.get("peer_unverified"):
+            return self.deny(cmd, "peer answer must be verified before use")
+        request_text = " ".join(str(value).lower() for value in cmd.args.values())
+        if any(marker in request_text for marker in (
+            "system override", "ignore previous", "ignore all previous",
+            "also record this for", "reveal the", "print the",
+        )):
+            return self.deny(cmd, "instruction-shaped content is quarantined")
+        if (cmd.server, cmd.tool) == ("slides", "get_frame"):
+            if not cmd.lease_id or cmd.lease_id not in set(getattr(self.ctx, "leases", ())):
+                return self.deny(cmd, "slides.get_frame requires a live query lease")
 
         # ------------------------------------------------------------------
         # JOB 1 — ROUTE: is this the right SERVER/REPLICA for this command?
@@ -420,10 +471,43 @@ class Gateway:
         # starter: never rewrites a mask and never paces spend — it trusts
         # the model's own field mask exactly as written, every time.
 
+        server, tool = _SUCCESSORS.get((cmd.server, cmd.tool), (cmd.server, cmd.tool))
+        headers = {k: v for k, v in cmd.headers.items() if k.lower() != "x-mcp-body-route"}
+        headers["Mcp-Replica"] = headers.get("Mcp-Replica", "w")
+        fields = cmd.fields or _DEFAULT_MASKS.get((server, tool), ("anchor",))
+        if (server, tool) in {("registry", "list_servers"), ("glossary", "list_terms")} and fields == ("*",):
+            fields = ("name",) if server == "registry" else ("term",)
+        routed = replace(cmd, server=server, tool=tool, headers=headers, fields=tuple(fields))
+
+        if (routed.server, routed.tool) in _WRITE_TOOLS:
+            if "wiki.write:progress" not in getattr(self.ctx, "scopes", frozenset()):
+                return self.deny(cmd, "write scope was not granted")
+            anchor = str(routed.args.get("anchor", ""))
+            etag = self._etags.get(anchor)
+            key = f"{routed.server}.{routed.tool}:{anchor}"
+            if not etag:
+                return self.deny(cmd, "write requires fresh provenance and If-Match")
+            if key in self._idempotency_keys:
+                return self.deny(cmd, "write already committed in this duel")
+            headers = dict(routed.headers)
+            headers["If-Match"] = etag
+            headers["Idempotency-Key"] = key
+            self._idempotency_keys.add(key)
+            routed = replace(routed, headers=headers)
+
         call = self._to_tool_call(routed)
-        decision = Decision(verdict="forward", call=call)
+        decision = Decision(verdict="rewrite" if routed != cmd else "forward", call=call)
         self._telemetry.decision_made(cmd, decision)
         return decision
+
+    def note_card(self, server: str, card: Mapping[str, Any]) -> None:
+        """Record an arena-verified peer card for later A2A admission checks."""
+        self._admitted_cards[server] = dict(card)
+
+    def note_provenance(self, anchor: str, etag: str) -> None:
+        """Record fresh provenance so an exactly-once write can be authorised."""
+        if anchor and etag:
+            self._etags[anchor] = etag
 
     def deny(self, cmd: Command, reason: str) -> Decision:
         """Not called anywhere in this starter's `decide()` — a ready-made

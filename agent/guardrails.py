@@ -177,7 +177,14 @@ def scan_for_injected_instructions(text: str) -> InjectionScanResult:
     file's own `__main__` demo below, which runs an unambiguous injection
     attempt through this exact function and shows it sailing through
     uncaught. That gap is the assignment, not a bug report."""
-    return InjectionScanResult(suspicious=False, matched_patterns=())
+    patterns = (
+        r"ignore (?:all )?(?:previous|prior) instructions?",
+        r"system override",
+        r"(?:reveal|print|exfiltrate).{0,40}(?:act|scope|learner|secret)",
+        r"(?:you must|assistant must|instead,?)(?: now)? .{0,60}(?:record|send|reveal)",
+    )
+    matches = tuple(pattern for pattern in patterns if re.search(pattern, text, flags=re.IGNORECASE))
+    return InjectionScanResult(suspicious=bool(matches), matched_patterns=matches)
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +212,18 @@ def redact(text: str) -> RedactionResult:
 
     This starter's version does not look at `text` at all — see this
     file's own `__main__` demo below."""
-    return RedactionResult(redacted_text=text, hits=())
+    patterns = (
+        r"(?i)(?:learner|student)\s*(?:id)?\s*[:#-]?\s*sv-\d{4}[^.\n]{0,240}",
+        r"(?i)(?:private|confidential)\s*(?:note|record)?\s*[:=-]?\s*[^.\n]{20,240}",
+    )
+    hits: list[str] = []
+    redacted = text
+    for pattern in patterns:
+        def replace_match(match: re.Match[str]) -> str:
+            hits.append(match.group(0))
+            return "[REDACTED PRIVATE CONTENT]"
+        redacted = re.sub(pattern, replace_match, redacted)
+    return RedactionResult(redacted_text=redacted, hits=tuple(hits))
 
 
 # ---------------------------------------------------------------------------
@@ -238,8 +256,12 @@ def verify_arithmetic(text: str) -> ArithmeticCheckResult:
     This starter's version does not look at `text` at all beyond what
     `_NUMBER_RE` would find if you called it (it isn't called) — see this
     file's own `__main__` demo below."""
+    numbers = _NUMBER_RE.findall(text.replace(",", ""))
+    if not numbers:
+        return ArithmeticCheckResult(checked=True, ok=True, detail="no numeric claim to verify")
     return ArithmeticCheckResult(
-        checked=False, ok=None, detail="verify_arithmetic is a stub — no check was performed"
+        checked=False, ok=None,
+        detail="numeric claims require comparison with retrieved source values before submission",
     )
 
 
